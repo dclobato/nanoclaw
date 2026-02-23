@@ -203,6 +203,12 @@ export class WhatsAppChannel implements Channel {
     });
   }
 
+  async sendImage(jid: string, imagePath: string, caption: string): Promise<void> {
+    const image = fs.readFileSync(imagePath);
+    await this.sock.sendMessage(jid, { image, caption });
+    logger.info({ jid, imagePath }, 'Image sent');
+  }
+
   async sendMessage(jid: string, text: string): Promise<void> {
     // Prefix bot messages with assistant name so users know who's speaking.
     // On a shared number, prefix is also needed in DMs (including self-chat)

@@ -1,21 +1,26 @@
+import { execSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
 import {
   ASSISTANT_NAME,
+  DATA_DIR,
   IDLE_TIMEOUT,
   MAIN_GROUP_FOLDER,
   POLL_INTERVAL,
+  TELEGRAM_BOT_POOL,
+  TELEGRAM_BOT_TOKEN,
+  TELEGRAM_ONLY,
   TRIGGER_PATTERN,
 } from './config.js';
 import { WhatsAppChannel } from './channels/whatsapp.js';
+import { TelegramChannel, initBotPool, sendPoolMessage } from './channels/telegram.js';
 import {
   ContainerOutput,
   runContainerAgent,
   writeGroupsSnapshot,
   writeTasksSnapshot,
 } from './container-runner.js';
-import { cleanupOrphans, ensureContainerRuntimeRunning } from './container-runtime.js';
 import {
   getAllChats,
   getAllRegisteredGroups,
@@ -25,19 +30,29 @@ import {
   getNewMessages,
   getRouterState,
   initDatabase,
+  isEmailProcessed,
+  markEmailProcessed,
+  markEmailResponded,
   setRegisteredGroup,
   setRouterState,
   setSession,
   storeChatMetadata,
   storeMessage,
 } from './db.js';
+import {
+  EMAIL_POLL_INTERVAL_MS,
+  EmailMessage,
+  fetchUnreadEmails,
+  isGmailConfigured,
+  markEmailAsRead,
+} from './email-channel.js';
 import { GroupQueue } from './group-queue.js';
-import { resolveGroupFolderPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
 import { findChannel, formatMessages, formatOutbound } from './router.js';
 import { startSchedulerLoop } from './task-scheduler.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
+import { ensureContainerRuntimeRunning, cleanupOrphans } from './container-runtime.js';
 
 // Re-export for backwards compatibility during refactor
 export { escapeXml, formatMessages } from './router.js';
@@ -78,21 +93,11 @@ function saveState(): void {
 }
 
 function registerGroup(jid: string, group: RegisteredGroup): void {
-  let groupDir: string;
-  try {
-    groupDir = resolveGroupFolderPath(group.folder);
-  } catch (err) {
-    logger.warn(
-      { jid, folder: group.folder, err },
-      'Rejecting group registration with invalid folder',
-    );
-    return;
-  }
-
   registeredGroups[jid] = group;
   setRegisteredGroup(jid, group);
 
   // Create group folder
+  const groupDir = path.join(DATA_DIR, '..', 'groups', group.folder);
   fs.mkdirSync(path.join(groupDir, 'logs'), { recursive: true });
 
   logger.info(
@@ -124,6 +129,23 @@ export function _setRegisteredGroups(groups: Record<string, RegisteredGroup>): v
   registeredGroups = groups;
 }
 
+function parseMediaFromOutput(text: string): { mediaPath?: string; cleanText: string } {
+  const lines = text.split('\n');
+  const idx = lines.findIndex((l) => l.startsWith('MEDIA: '));
+  if (idx === -1) return { cleanText: text };
+  const mediaPath = lines[idx].slice('MEDIA: '.length).trim();
+  const cleanText = lines.filter((_, i) => i !== idx).join('\n').replace(/\n{3,}/g, '\n\n').trim();
+  return { mediaPath, cleanText };
+}
+
+function resolveContainerPath(containerPath: string, group: RegisteredGroup): string | null {
+  if (containerPath.startsWith('/workspace/group/')) {
+    const rel = containerPath.slice('/workspace/group/'.length);
+    return path.join(process.cwd(), 'groups', group.folder, rel);
+  }
+  return null;
+}
+
 /**
  * Process all pending messages for a group.
  * Called by the GroupQueue when it's this group's turn.
@@ -133,10 +155,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   if (!group) return true;
 
   const channel = findChannel(channels, chatJid);
-  if (!channel) {
-    console.log(`Warning: no channel owns JID ${chatJid}, skipping messages`);
-    return true;
-  }
+  if (!channel) return true;
 
   const isMainGroup = group.folder === MAIN_GROUP_FOLDER;
 
@@ -190,15 +209,21 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
       logger.info({ group: group.name }, `Agent output: ${raw.slice(0, 200)}`);
       if (text) {
-        await channel.sendMessage(chatJid, text);
+        const { mediaPath, cleanText } = parseMediaFromOutput(text);
+        if (mediaPath && channel.sendImage) {
+          const hostPath = resolveContainerPath(mediaPath, group);
+          if (hostPath && fs.existsSync(hostPath)) {
+            await channel.sendImage(chatJid, hostPath, cleanText);
+            outputSentToUser = true;
+            resetIdleTimer();
+            return;
+          }
+        }
+        await channel.sendMessage(chatJid, cleanText || text);
         outputSentToUser = true;
       }
       // Only reset idle timer on actual results, not session-update markers (result: null)
       resetIdleTimer();
-    }
-
-    if (result.status === 'success') {
-      queue.notifyIdle(chatJid);
     }
 
     if (result.status === 'error') {
@@ -280,7 +305,6 @@ async function runAgent(
         groupFolder: group.folder,
         chatJid,
         isMain,
-        assistantName: ASSISTANT_NAME,
       },
       (proc, containerName) => queue.registerProcess(chatJid, proc, containerName, group.folder),
       wrappedOnOutput,
@@ -343,10 +367,7 @@ async function startMessageLoop(): Promise<void> {
           if (!group) continue;
 
           const channel = findChannel(channels, chatJid);
-          if (!channel) {
-            console.log(`Warning: no channel owns JID ${chatJid}, skipping messages`);
-            continue;
-          }
+          if (!channel) continue;
 
           const isMainGroup = group.folder === MAIN_GROUP_FOLDER;
           const needsTrigger = !isMainGroup && group.requiresTrigger !== false;
@@ -381,9 +402,7 @@ async function startMessageLoop(): Promise<void> {
               messagesToSend[messagesToSend.length - 1].timestamp;
             saveState();
             // Show typing indicator while the container processes the piped message
-            channel.setTyping?.(chatJid, true)?.catch((err) =>
-              logger.warn({ chatJid, err }, 'Failed to set typing indicator'),
-            );
+            channel.setTyping?.(chatJid, true);
           } else {
             // No active container — enqueue for a new one
             queue.enqueueMessageCheck(chatJid);
@@ -415,13 +434,96 @@ function recoverPendingMessages(): void {
   }
 }
 
-function ensureContainerSystemRunning(): void {
-  ensureContainerRuntimeRunning();
-  cleanupOrphans();
+
+async function startEmailLoop(): Promise<void> {
+  if (!isGmailConfigured()) {
+    logger.debug('Gmail not configured, skipping email loop');
+    return;
+  }
+
+  logger.info('Email channel starting — polling all unread inbox emails');
+
+  const poll = async () => {
+    try {
+      const emails = await fetchUnreadEmails();
+      for (const email of emails) {
+        if (isEmailProcessed(email.id)) continue;
+
+        logger.info({ from: email.from, subject: email.subject }, 'Processing new email');
+        markEmailProcessed(email.id, email.threadId, email.from, email.subject);
+
+        // Mark as read immediately so it doesn't re-trigger on next poll
+        try { await markEmailAsRead(email.id); } catch { /* best effort */ }
+
+        const folderSafe = email.threadId.replace(/[^a-zA-Z0-9]/g, '').slice(0, 40);
+        const folder = `email-${folderSafe}`;
+        const groupDir = path.join(process.cwd(), 'groups', folder);
+        fs.mkdirSync(groupDir, { recursive: true });
+
+        const emailGroup: RegisteredGroup = {
+          name: `email ${folderSafe}`,
+          folder,
+          trigger: '',
+          added_at: new Date().toISOString(),
+          requiresTrigger: false,
+        };
+
+        const prompt = `You received an email. Read it and decide if it genuinely requires a reply.
+
+From: ${email.from}
+Subject: ${email.subject}
+Date: ${email.date}
+
+${email.body}
+
+---
+
+*Only reply if the email genuinely requires a personal response* — e.g. a question, a request, something that needs follow-up, or a message from a real person expecting an answer.
+
+Do NOT reply to: spam, ads, newsletters, promotional emails, automated notifications, receipts, order confirmations, mailing lists, or anything that does not expect a human reply.
+
+If a reply is needed, use mcp__gmail__send_email to send it. Be professional and concise.
+If no reply is needed, wrap your entire output in <internal> tags and do nothing.`;
+
+        const chatJid = `email:${email.threadId}`;
+        const sessionId = sessions[folder];
+
+        try {
+          const output = await runContainerAgent(
+            emailGroup,
+            {
+              prompt,
+              sessionId,
+              groupFolder: folder,
+              chatJid,
+              isMain: false,
+              isScheduledTask: true,
+            },
+            (proc, containerName) => queue.registerProcess(chatJid, proc, containerName, folder),
+          );
+
+          if (output.newSessionId) {
+            sessions[folder] = output.newSessionId;
+            setSession(folder, output.newSessionId);
+          }
+          markEmailResponded(email.id);
+          logger.info({ from: email.from, subject: email.subject }, 'Email processed');
+        } catch (err) {
+          logger.error({ err, from: email.from }, 'Failed to process email via agent');
+        }
+      }
+    } catch (err) {
+      logger.error({ err }, 'Email poll error');
+    }
+    setTimeout(poll, EMAIL_POLL_INTERVAL_MS);
+  };
+
+  setTimeout(poll, 5000); // Initial delay to let service settle
 }
 
 async function main(): Promise<void> {
-  ensureContainerSystemRunning();
+  ensureContainerRuntimeRunning();
+  cleanupOrphans();
   initDatabase();
   logger.info('Database initialized');
   loadState();
@@ -445,9 +547,20 @@ async function main(): Promise<void> {
   };
 
   // Create and connect channels
-  whatsapp = new WhatsAppChannel(channelOpts);
-  channels.push(whatsapp);
-  await whatsapp.connect();
+  if (!TELEGRAM_ONLY) {
+    whatsapp = new WhatsAppChannel(channelOpts);
+    channels.push(whatsapp);
+    await whatsapp.connect();
+  }
+
+  if (TELEGRAM_BOT_TOKEN) {
+    const telegram = new TelegramChannel(TELEGRAM_BOT_TOKEN, channelOpts);
+    channels.push(telegram);
+    await telegram.connect();
+    if (TELEGRAM_BOT_POOL.length > 0) {
+      await initBotPool(TELEGRAM_BOT_POOL);
+    }
+  }
 
   // Start subsystems (independently of connection handler)
   startSchedulerLoop({
@@ -457,10 +570,7 @@ async function main(): Promise<void> {
     onProcess: (groupJid, proc, containerName, groupFolder) => queue.registerProcess(groupJid, proc, containerName, groupFolder),
     sendMessage: async (jid, rawText) => {
       const channel = findChannel(channels, jid);
-      if (!channel) {
-        console.log(`Warning: no channel owns JID ${jid}, cannot send message`);
-        return;
-      }
+      if (!channel) return;
       const text = formatOutbound(rawText);
       if (text) await channel.sendMessage(jid, text);
     },
@@ -471,6 +581,7 @@ async function main(): Promise<void> {
       if (!channel) throw new Error(`No channel for JID: ${jid}`);
       return channel.sendMessage(jid, text);
     },
+    sendPoolMessage,
     registeredGroups: () => registeredGroups,
     registerGroup,
     syncGroupMetadata: (force) => whatsapp?.syncGroupMetadata(force) ?? Promise.resolve(),
@@ -479,10 +590,8 @@ async function main(): Promise<void> {
   });
   queue.setProcessMessagesFn(processGroupMessages);
   recoverPendingMessages();
-  startMessageLoop().catch((err) => {
-    logger.fatal({ err }, 'Message loop crashed unexpectedly');
-    process.exit(1);
-  });
+  startMessageLoop();
+  startEmailLoop();
 }
 
 // Guard: only run when executed directly, not when imported by tests
