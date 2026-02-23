@@ -92,6 +92,22 @@ function saveState(): void {
   );
 }
 
+function slugifyGroupName(name: string): string {
+  let slug = name
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 40);
+  if (!slug || !/^[a-z0-9]/.test(slug)) slug = 'group-' + slug;
+  const existingFolders = new Set(Object.values(registeredGroups).map(g => g.folder));
+  let candidate = slug;
+  let i = 2;
+  while (existingFolders.has(candidate) || candidate === MAIN_GROUP_FOLDER) {
+    candidate = `${slug}-${i++}`;
+  }
+  return candidate;
+}
+
 function registerGroup(jid: string, group: RegisteredGroup): void {
   registeredGroups[jid] = group;
   setRegisteredGroup(jid, group);
@@ -164,8 +180,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   if (missedMessages.length === 0) return true;
 
-  // For non-main groups, check if trigger is required and present
-  if (!isMainGroup && group.requiresTrigger !== false) {
+  // For non-main groups, check if trigger is required and present.
+  // requiresTrigger must be explicitly set to true to enforce the trigger filter;
+  // the default (undefined/false) lets all messages through so Andy can decide.
+  if (!isMainGroup && group.requiresTrigger === true) {
     const hasTrigger = missedMessages.some((m) =>
       TRIGGER_PATTERN.test(m.content.trim()),
     );
@@ -370,9 +388,9 @@ async function startMessageLoop(): Promise<void> {
           if (!channel) continue;
 
           const isMainGroup = group.folder === MAIN_GROUP_FOLDER;
-          const needsTrigger = !isMainGroup && group.requiresTrigger !== false;
+          const needsTrigger = !isMainGroup && group.requiresTrigger === true;
 
-          // For non-main groups, only act on trigger messages.
+          // For groups with requiresTrigger: true, only act on trigger messages.
           // Non-trigger messages accumulate in DB and get pulled as
           // context when a trigger eventually arrives.
           if (needsTrigger) {
@@ -541,8 +559,18 @@ async function main(): Promise<void> {
   // Channel callbacks (shared by all channels)
   const channelOpts = {
     onMessage: (_chatJid: string, msg: NewMessage) => storeMessage(msg),
-    onChatMetadata: (chatJid: string, timestamp: string, name?: string, channel?: string, isGroup?: boolean) =>
-      storeChatMetadata(chatJid, timestamp, name, channel, isGroup),
+    onChatMetadata: (chatJid: string, timestamp: string, name?: string, channel?: string, isGroup?: boolean) => {
+      storeChatMetadata(chatJid, timestamp, name, channel, isGroup);
+      if (isGroup && !registeredGroups[chatJid]) {
+        const folderName = slugifyGroupName(name || chatJid);
+        registerGroup(chatJid, {
+          name: name || chatJid,
+          folder: folderName,
+          trigger: `@${ASSISTANT_NAME}`,
+          added_at: new Date().toISOString(),
+        });
+      }
+    },
     registeredGroups: () => registeredGroups,
   };
 
